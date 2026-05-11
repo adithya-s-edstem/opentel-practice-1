@@ -1,0 +1,41 @@
+# =============================================================================
+# Prometheus scrape configuration
+# =============================================================================
+#
+# WHAT IS PROMETHEUS?
+# Prometheus is a time-series database for *metrics* (numeric measurements
+# over time: request rates, latencies, queue depths, etc.). It works on
+# a pull model: every `scrape_interval` it makes an HTTP GET against
+# each target's `/metrics` endpoint, parses the result, and stores it.
+#
+# Our setup does NOT have apps exposing /metrics directly. Instead:
+#
+#   app  --(OTLP push)-->  otel-collector  --(/metrics scrape)-->  prometheus
+#
+# This means Prometheus only has to know about ONE target (the collector),
+# regardless of how many app instances we run. Adding a new service just
+# means pointing it at the collector — no Prometheus config change.
+# =============================================================================
+
+global:
+  scrape_interval: 10s       # how often to pull /metrics from each target
+  evaluation_interval: 10s   # how often to evaluate alert rules (we have none)
+
+scrape_configs:
+  # The collector exposes app metrics here. This is where the time-series
+  # for everything our Flask app and load generator emit actually shows up.
+  - job_name: otel-collector-apps
+    static_configs:
+      - targets: ["otel-collector:8889"]
+
+  # The collector also exposes ITS OWN metrics on a different port. These
+  # describe collector health: how many spans it received, dropped,
+  # exported, etc. Hugely useful for catching pipeline problems early.
+  - job_name: otel-collector-internal
+    static_configs:
+      - targets: ["otel-collector:8888"]
+
+  # Self-scrape so Prometheus has metrics about itself (handy and free).
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

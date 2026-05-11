@@ -1,0 +1,21 @@
+# =============================================================================
+# Dashboard provider
+# =============================================================================
+# Tells Grafana "look in /var/lib/grafana/dashboards on disk and load any
+# .json file you find as a dashboard". We mount our dashboard JSON into
+# that path from the host in docker-compose. Editing a dashboard JSON file
+# and restarting Grafana is enough to update it.
+# =============================================================================
+
+apiVersion: 1
+
+providers:
+  - name: "todo-dashboards"
+    orgId: 1
+    folder: "Todo App"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true   # you can still tweak in the UI for exploration
+    options:
+      path: /var/lib/grafana/dashboards

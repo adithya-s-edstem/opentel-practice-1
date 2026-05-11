@@ -1,0 +1,24 @@
+Flask==3.0.3
+Flask-Cors==4.0.1
+Flask-Migrate==4.0.7
+Flask-SQLAlchemy==3.1.1
+psycopg2-binary==2.9.9
+pydantic==2.10.4
+python-dotenv==1.0.1
+
+# -----------------------------------------------------------------------------
+# OpenTelemetry — instrumentation, SDK, and exporters.
+# All three signals (traces, metrics, logs) come from these packages.
+# Versions are pinned together because OTel components only guarantee
+# compatibility across matching minor versions of the SDK + instrumentation.
+# -----------------------------------------------------------------------------
+opentelemetry-api==1.29.0
+opentelemetry-sdk==1.29.0
+opentelemetry-exporter-otlp-proto-grpc==1.29.0
+
+# Auto-instrumentation packages: each one wraps a specific library so we
+# get spans/metrics for free without writing code per-call.
+opentelemetry-instrumentation-flask==0.50b0
+opentelemetry-instrumentation-sqlalchemy==0.50b0
+opentelemetry-instrumentation-psycopg2==0.50b0
+opentelemetry-instrumentation-logging==0.50b0

@@ -1,0 +1,124 @@
+# =============================================================================
+# OpenTelemetry Collector configuration
+# =============================================================================
+#
+# WHAT IS THE COLLECTOR?
+# The OpenTelemetry Collector is a single process that accepts telemetry
+# (traces, metrics, logs) from many sources, optionally processes it
+# (batching, filtering, renaming), and then exports it to one or more
+# backends. Apps talk OTLP to the collector; the collector handles the
+# vendor-specific "how do I get this into Jaeger/Prometheus/Loki" part.
+#
+# Without a collector you'd have to teach every service the URL and
+# protocol of every backend. With it, services only know "OTLP -> collector"
+# and you can change/add backends by editing this file alone.
+#
+# A collector config always has three top-level sections:
+#   receivers  - how telemetry comes IN  (e.g. OTLP from our apps)
+#   processors - what we do to it in flight (e.g. batch, add labels)
+#   exporters  - where telemetry goes OUT (Jaeger, Prometheus, Loki, ...)
+# Plus a `service.pipelines` section that wires receivers -> processors
+# -> exporters for each signal type (traces / metrics / logs).
+# =============================================================================
+
+receivers:
+  # OTLP is OpenTelemetry's native wire protocol. The Flask backend speaks
+  # it (Python SDK over gRPC), so this one receiver handles every signal
+  # type from every source.
+  otlp:
+    protocols:
+      grpc:
+        # 4317 is the well-known gRPC OTLP port. The backend connects here.
+        endpoint: 0.0.0.0:4317
+      http:
+        # 4318 is the well-known HTTP/protobuf OTLP port. Left enabled for
+        # any future non-gRPC client; nothing currently uses it.
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Batch spans/metrics/logs before exporting. Without this every span
+  # would be its own network call, which destroys performance under load.
+  batch:
+    timeout: 1s
+    send_batch_size: 512
+
+  # Tag every signal with environment metadata. This lets you filter in
+  # Grafana ("show me only prod" / "only local") without changing app code.
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: local
+        action: upsert
+
+exporters:
+  # ---------------------------------------------------------------------------
+  # TRACES -> Jaeger.
+  # Jaeger's all-in-one image accepts OTLP/gRPC on 4317 (enabled via the
+  # COLLECTOR_OTLP_ENABLED env var in docker-compose). We give the collector
+  # a separate alias from the receiver's `otlp` to keep things obvious.
+  # ---------------------------------------------------------------------------
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true   # local network, no TLS needed
+
+  # ---------------------------------------------------------------------------
+  # METRICS -> Prometheus.
+  # Prometheus is *pull-based*: it scrapes an HTTP endpoint on a schedule.
+  # The `prometheus` exporter turns our incoming OTLP metrics into a
+  # Prometheus-format /metrics page on port 8889 which Prometheus scrapes.
+  # `resource_to_telemetry_conversion` copies the resource attributes
+  # (service.name, environment, ...) onto every metric as labels so you
+  # can filter by them in PromQL.
+  # ---------------------------------------------------------------------------
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    resource_to_telemetry_conversion:
+      enabled: true
+    enable_open_metrics: true
+
+  # ---------------------------------------------------------------------------
+  # LOGS -> Loki (via OTLP/HTTP).
+  # Loki 3.x accepts OTLP natively at /otlp/v1/logs. We use the otlphttp
+  # exporter and let Loki translate OTel log records into its own format.
+  # Loki will pull a small set of attributes (service.name, etc.) up as
+  # stream labels and keep the rest as structured metadata.
+  # ---------------------------------------------------------------------------
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+
+  # The `debug` exporter just prints to the collector's stdout. Useful
+  # when you're learning and want to confirm "yes, the collector really
+  # is receiving the spans I think it is". Switch verbosity to `detailed`
+  # if you want to see the actual contents; `basic` just shows counts.
+  debug:
+    verbosity: basic
+
+service:
+  # The pipelines section is the actual data flow graph. Each pipeline is
+  # a list of receivers -> processors (in order) -> exporters (parallel).
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [resource, batch]
+      exporters: [otlp/jaeger, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [resource, batch]
+      exporters: [prometheus, debug]
+    logs:
+      receivers: [otlp]
+      processors: [resource, batch]
+      exporters: [otlphttp/loki, debug]
+
+  # The collector itself emits telemetry about its own health.
+  # We expose its internal metrics on :8888 so Prometheus can scrape them
+  # and we can spot e.g. "collector is dropping spans" before it bites us.
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888

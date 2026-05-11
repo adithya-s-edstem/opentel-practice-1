@@ -1,0 +1,209 @@
+# =============================================================================
+# Todo app + full OpenTelemetry observability stack
+# =============================================================================
+#
+# Services in this file fall into two groups:
+#
+#   APP                       OBSERVABILITY
+#   ────────                  ────────────────
+#   db        (postgres)      otel-collector   (single entry point for OTLP)
+#   backend   (flask)         jaeger           (traces backend + UI)
+#   frontend  (vite/react)    prometheus       (metrics database)
+#   loadgen   (opt-in)        loki             (logs database)
+#                             grafana          (visualizes all three)
+#
+# loadgen is in the "load" Compose profile, so it does NOT start with
+# `docker compose up`. Start it explicitly with:
+#   docker compose --profile load up -d loadgen
+# or run a one-shot session:
+#   docker compose run --rm loadgen
+#
+# Data flow:
+#   backend / frontend / loadgen ── OTLP ──▶ otel-collector ──▶ jaeger
+#                                                          ──▶ prometheus
+#                                                          ──▶ loki
+#                                                                  │
+#                                              grafana ◀───────────┴── (all three as datasources)
+#
+# Ports exposed to your host:
+#   5173  frontend (the todo app)
+#   5000  backend  (the API)
+#   5432  postgres
+#   3000  grafana   ← the main "dashboard" UI
+#   16686 jaeger    ← traces UI
+#   9090  prometheus ← metrics UI (raw PromQL)
+#   3100  loki       ← (queried by grafana, occasionally curl-able)
+#   4317  otel-collector OTLP/gRPC
+#   4318  otel-collector OTLP/HTTP  ← used by browser
+#   8889  otel-collector prometheus exporter (scraped by prometheus)
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Application services
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: todo
+      POSTGRES_PASSWORD: todo
+      POSTGRES_DB: todo
+    ports:
+      - "5432:5432"
+    volumes:
+      - todo_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U todo -d todo"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg2://todo:todo@db:5432/todo
+      FLASK_DEBUG: "1"
+      # OTel SDK reads these automatically. The endpoint targets the
+      # collector's gRPC port; everything (traces, metrics, logs) goes
+      # to the same place.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      OTEL_SERVICE_NAME: todo-backend
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=local,service.version=0.1.0
+    depends_on:
+      db:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./backend:/app
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+
+  loadgen:
+    build: ./loadgen
+    # Profiles let a service be defined but NOT started by default. Plain
+    # `docker compose up` skips this; you opt in with one of:
+    #   docker compose --profile load up        # include it in the stack
+    #   docker compose run --rm loadgen         # one-shot, foreground
+    profiles: ["load"]
+    environment:
+      BACKEND_URL: http://backend:5000
+      LOADGEN_RPS: "2"
+      LOADGEN_ERROR_FRACTION: "0.05"
+    depends_on:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # OpenTelemetry Collector
+  #
+  # The single point of contact for our apps. It accepts OTLP and fans the
+  # signals out to the right backend. If you ever swap Jaeger for Tempo or
+  # Loki for Elasticsearch, this is the only thing that changes.
+  # ---------------------------------------------------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.116.1
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./observability/otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP/gRPC  (backend, loadgen)
+      - "4318:4318"   # OTLP/HTTP  (browser)
+      - "8889:8889"   # /metrics scrape target for Prometheus
+      - "8888:8888"   # collector's OWN internal metrics
+    depends_on:
+      - jaeger
+      - loki
+      - prometheus
+
+  # ---------------------------------------------------------------------------
+  # Jaeger — traces.
+  #
+  # all-in-one bundles the collector, query, and UI into one container.
+  # Production deployments split these out and put the data in Cassandra
+  # or Elasticsearch. For learning, all-in-one is fine.
+  #
+  # COLLECTOR_OTLP_ENABLED makes Jaeger accept OTLP directly on 4317/4318.
+  # (Without this it expects its own legacy thrift protocol on 14250.)
+  # ---------------------------------------------------------------------------
+  jaeger:
+    image: jaegertracing/all-in-one:1.64.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # Jaeger UI
+      # The OTLP receive ports (4317/4318) are NOT exposed to the host —
+      # only the OTel Collector talks to Jaeger, and it does so over the
+      # docker network.
+
+  # ---------------------------------------------------------------------------
+  # Prometheus — metrics.
+  #
+  # Configuration tells it to scrape the OTel collector. See
+  # observability/prometheus.yml.
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.enable-remote-write-receiver"     # not used, but cheap
+      - "--enable-feature=exemplar-storage"      # lets exemplars work
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom_data:/prometheus
+    ports:
+      - "9090:9090"
+
+  # ---------------------------------------------------------------------------
+  # Loki — logs.
+  # ---------------------------------------------------------------------------
+  loki:
+    image: grafana/loki:3.3.2
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    volumes:
+      - ./observability/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+
+  # ---------------------------------------------------------------------------
+  # Grafana — visualization.
+  #
+  # Provisioning: datasources and dashboards are loaded from YAML/JSON on
+  # disk at startup, so a fresh container is immediately useful — no
+  # clicking around.
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"          # no login wall for local dev
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor,traceqlSearch"
+      GF_LOG_LEVEL: warn
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+      - jaeger
+    ports:
+      - "3000:3000"
+
+volumes:
+  todo_pgdata:
+  prom_data:
+  loki_data:
+  grafana_data:

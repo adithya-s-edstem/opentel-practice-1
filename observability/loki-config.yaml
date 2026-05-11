@@ -1,0 +1,67 @@
+# =============================================================================
+# Loki configuration (single-binary, filesystem storage)
+# =============================================================================
+#
+# WHAT IS LOKI?
+# Loki is "Prometheus for logs": a log database designed to be cheap by
+# indexing only a small set of labels (service, env, level, ...) rather
+# than the full text of every log line. You query it with LogQL, which
+# looks like PromQL plus a regex/JSON pipeline.
+#
+# This config runs Loki in "single-binary" mode (everything in one process,
+# storage on local disk). That's fine for learning/dev. In production you'd
+# split it into read/write/backend and put chunks in object storage (S3/GCS).
+#
+# Logs reach Loki via the OpenTelemetry Collector: our app emits OTel log
+# records -> collector -> Loki's native OTLP endpoint (/otlp/v1/logs).
+# Loki picks a few OTel attributes as STREAM LABELS (cheap to index, used
+# for filtering) and stores the rest as STRUCTURED METADATA (not indexed
+# but queryable and shown in Grafana).
+# =============================================================================
+
+auth_enabled: false   # no multi-tenancy in this learning setup
+
+server:
+  http_listen_port: 3100   # this is the API & UI port (Grafana queries this)
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki         # everything under here is persistent state
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory        # single-node, no real ring needed
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+
+schema_config:
+  configs:
+    - from: 2024-01-01       # schema version effective from this date
+      store: tsdb            # tsdb is the modern Loki index store
+      object_store: filesystem
+      schema: v13            # v13 supports structured metadata (needed for OTLP)
+      index:
+        prefix: index_
+        period: 24h          # one index file per day
+
+limits_config:
+  # Required for OTel-native log ingestion. Without this Loki rejects
+  # OTLP pushes because they carry structured metadata.
+  allow_structured_metadata: true
+  # Enables /loki/api/v1/index/volume so Grafana's Logs Explorer can
+  # show "which streams have data" — nice quality-of-life for browsing.
+  volume_enabled: true
+  retention_period: 168h     # 7 days (we have no compactor configured to
+                             # actually delete, but this caps acceptance)
+
+# Pattern matching is a Loki feature that auto-detects log patterns;
+# enabling it makes the "Patterns" tab in Grafana useful.
+pattern_ingester:
+  enabled: true
+
+ruler:
+  alertmanager_url: http://localhost:9093   # unused; here for completeness

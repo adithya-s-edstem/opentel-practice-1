@@ -1,0 +1,84 @@
+# =============================================================================
+# Grafana datasources (auto-provisioned)
+# =============================================================================
+#
+# Grafana reads everything under /etc/grafana/provisioning at startup and
+# creates the matching resources. Dropping this file in means Prometheus,
+# Loki, and Jaeger are wired up the moment Grafana boots — no clicking
+# through "Add datasource" in the UI.
+#
+# The `uid` of each datasource is its stable identifier. Dashboards and
+# derived-field links reference datasources by uid, so picking nice short
+# ones now saves pain later.
+# =============================================================================
+
+apiVersion: 1
+
+datasources:
+  # ---------------------------------------------------------------------------
+  # Prometheus: metrics
+  # Grafana uses this to render graphs of request rates, latencies, custom
+  # business counters, etc. PromQL is the query language.
+  # ---------------------------------------------------------------------------
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy                       # Grafana proxies queries (no CORS)
+    url: http://prometheus:9090
+    isDefault: true                     # default for new ad-hoc panels
+    jsonData:
+      # Tell Grafana to send the OTel exemplars feature so we can jump
+      # from a metric point straight to an example trace.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: jaeger
+
+  # ---------------------------------------------------------------------------
+  # Loki: logs
+  # `derivedFields` is the magic that turns a `trace_id=...` substring in
+  # a log line into a clickable link to Jaeger. This is the single most
+  # important UX feature of having all three signals in Grafana.
+  # ---------------------------------------------------------------------------
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      derivedFields:
+        - name: TraceID
+          # OTel's logging instrumentation puts the active trace id into
+          # log lines (the LoggingInstrumentor in backend/observability.py
+          # configures this format). We match that here.
+          matcherRegex: "trace_id=([a-f0-9]+)"
+          url: "$${__value.raw}"        # the $$ escapes for YAML; Grafana sees $
+          datasourceUid: jaeger
+          urlDisplayLabel: "View trace"
+
+  # ---------------------------------------------------------------------------
+  # Jaeger: distributed traces
+  # ---------------------------------------------------------------------------
+  - name: Jaeger
+    type: jaeger
+    uid: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    jsonData:
+      # Hook traces back to logs: from a span, "Logs for this span" runs
+      # a Loki query for the trace id. Closes the loop.
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-1m"
+        spanEndTimeShift: "1m"
+        filterByTraceID: true
+        customQuery: true
+        query: '{service_name="$${__span.tags["service.name"]}"} |= "$${__span.traceId}"'
+      # Hook traces back to metrics: from a span we can pivot to a PromQL
+      # query for the service's RED metrics around that timestamp.
+      tracesToMetrics:
+        datasourceUid: prometheus
+        spanStartTimeShift: "-2m"
+        spanEndTimeShift: "2m"
+        queries:
+          - name: "Request rate"
+            query: 'sum(rate(http_server_request_duration_milliseconds_count{service_name="$${__span.tags["service.name"]}"}[1m]))'
